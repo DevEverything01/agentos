@@ -2944,6 +2944,8 @@ export class AgentOs {
 		}
 	>();
 	private _languageProcessIds = new Map<string, number>();
+	private _disposed = false;
+	private _pendingExecutionWaits = new Set<(error: Error) => void>();
 	private _executionOutputHandlers = new Map<
 		string,
 		Set<(event: InternalExecutionOutputEvent) => void>
@@ -3560,11 +3562,11 @@ export class AgentOs {
 		});
 		let response: Awaited<ReturnType<SidecarProcess["sendVmRequest"]>>;
 		try {
-			response = await this._sidecarClient.sendVmRequest(
+			response = await this._untilDisposed(() => this._sidecarClient.sendVmRequest(
 				this._sidecarSession,
 				this._sidecarVm,
 				payload,
-			);
+			));
 		} catch (error) {
 			unsubscribeOutput();
 			unsubscribeCompleted();
@@ -3624,7 +3626,7 @@ export class AgentOs {
 			};
 		}
 		try {
-			await completion;
+			await this._untilDisposed(() => completion);
 			return await this._waitExecutionResult(response.response.operationId);
 		} finally {
 			cleanup();
@@ -4301,6 +4303,18 @@ export class AgentOs {
 		return response.response.executions.map(mapExecutionDescriptor);
 	}
 
+	private async _untilDisposed<T>(operation: () => Promise<T>): Promise<T> {
+		if (this._disposed) throw new Error("ERR_AGENTOS_VM_DISPOSED");
+		let rejectDisposed!: (error: Error) => void;
+		const disposed = new Promise<never>((_, reject) => { rejectDisposed = reject; });
+		this._pendingExecutionWaits.add(rejectDisposed);
+		try {
+			return await Promise.race([operation(), disposed]);
+		} finally {
+			this._pendingExecutionWaits.delete(rejectDisposed);
+		}
+	}
+
 	private async _waitExecutionResult(
 		executionId: string,
 	): Promise<MappedExecutionResult> {
@@ -4314,10 +4328,9 @@ export class AgentOs {
 		let response: Awaited<ReturnType<SidecarProcess["sendVmRequest"]>>;
 		try {
 			try {
-				response = await this._sidecarClient.sendVmRequest(
-					this._sidecarSession,
-					this._sidecarVm,
-					{ type: "wait_execution", request: { executionId } },
+				response = await this._untilDisposed(() =>
+					this._sidecarClient.sendVmRequest(this._sidecarSession, this._sidecarVm,
+						{ type: "wait_execution", request: { executionId } }),
 				);
 			} catch (error) {
 				if (
@@ -4326,11 +4339,10 @@ export class AgentOs {
 				) {
 					throw error;
 				}
-				await completion;
-				response = await this._sidecarClient.sendVmRequest(
-					this._sidecarSession,
-					this._sidecarVm,
-					{ type: "wait_execution", request: { executionId } },
+				await this._untilDisposed(() => completion);
+				response = await this._untilDisposed(() =>
+					this._sidecarClient.sendVmRequest(this._sidecarSession, this._sidecarVm,
+						{ type: "wait_execution", request: { executionId } }),
 				);
 			}
 		} finally {
@@ -6195,7 +6207,7 @@ export class AgentOs {
 				case "ext":
 					return this._handleAcpExtSidecarRequest(request.payload.envelope);
 			}
-		});
+		}, this._sidecarVm.vmId);
 	}
 
 	private async _handleAcpExtSidecarRequest(envelope: {
@@ -6781,6 +6793,11 @@ export class AgentOs {
 	}
 
 	async dispose(): Promise<void> {
+		this._disposed = true;
+		for (const reject of this._pendingExecutionWaits) {
+			reject(new Error("ERR_AGENTOS_VM_DISPOSED"));
+		}
+		this._pendingExecutionWaits.clear();
 		this._cronManager.dispose();
 
 		for (const [id, entry] of this._shells) {
@@ -6827,6 +6844,7 @@ export class AgentOs {
 				result.status === "rejected" ? [result.reason] : [],
 			),
 		);
+		this._sidecarClient.setSidecarRequestHandler(null, this._sidecarVm.vmId);
 		if (errors.length === 1) throw errors[0];
 		if (errors.length > 1) {
 			throw new AggregateError(errors, "AgentOS VM disposal failed");
@@ -7314,11 +7332,13 @@ async function leaseAgentOsSidecarVm<TVmAdmin extends InProcessSidecarVmAdmin>(
 				disposed = true;
 				state.activeLeases.delete(leaseRecord!);
 				state.description.activeVmCount = state.activeLeases.size;
-				await client.dispose();
-				// Release this lease's hold; the shared sidecar is unref'd only
-				// once the last hold (across all in-flight + active leases) drops,
-				// so a one-shot host process can then exit on its own.
-				releaseHold();
+				try {
+					await client.dispose();
+				} finally {
+					// Release the lease even when native teardown rejects. Once the
+					// last in-flight or active lease drops, Node can exit on its own.
+					releaseHold();
+				}
 			},
 		};
 

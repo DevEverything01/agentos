@@ -440,6 +440,58 @@ describe("sidecar protocol client", () => {
 		client.dispose();
 	});
 
+	it("routes VM callbacks without borrowing a sibling or global handler", async () => {
+		const frameTransport = new MemoryFrameTransport();
+		const client = new SidecarProtocolClient({
+			frameTransport,
+			eventBufferCapacity: 8,
+			payloadCodec: "json",
+		});
+		const calls: string[] = [];
+		for (const vmId of ["a", "b"]) {
+			client.setSidecarRequestHandler(async (request) => {
+				calls.push(vmId);
+				if (request.payload.type === "js_bridge_call") {
+					return { type: "js_bridge_result", call_id: request.payload.call_id, result: vmId };
+				}
+				return { type: "host_callback_result", invocation_id: "invoke", result: vmId };
+			}, vmId);
+		}
+		client.setSidecarRequestHandler(async () => {
+			calls.push("global");
+			return { type: "host_callback_result", invocation_id: "invoke", result: "global" };
+		});
+		const emit = (vmId: string, requestId: number, bridge = false) => frameTransport.emitFrame({
+			frame_type: "sidecar_request",
+			schema: SIDECAR_PROTOCOL_SCHEMA,
+			request_id: requestId,
+			ownership: { scope: "vm", connection_id: "conn", session_id: "session", vm_id: vmId },
+			payload: bridge
+				? { type: "js_bridge_call", call_id: "bridge", mount_id: "mount", operation: "read_file", args: [] }
+				: { type: "host_callback", invocation_id: "invoke", callback_key: "tool", input: {}, timeout_ms: 1000 },
+		});
+		const response = (id: number) => frameTransport.writes.find(frame => "request_id" in frame && frame.request_id === id);
+		try {
+			emit("a", -1);
+			emit("b", -2, true);
+			emit("unregistered", -3);
+			await expect.poll(() => frameTransport.writes.length).toBe(3);
+			expect(calls).toEqual(["a", "b"]);
+			expect(response(-1)).toMatchObject({ request_id: -1, payload: { result: "a" } });
+			expect(response(-2)).toMatchObject({ request_id: -2, payload: { result: "b" } });
+			expect(response(-3)).toMatchObject({ request_id: -3, payload: { error: expect.stringContaining("no sidecar request handler") } });
+			client.setSidecarRequestHandler(null, "b");
+			emit("b", -4);
+			emit("a", -5, true);
+			await expect.poll(() => frameTransport.writes.length).toBe(5);
+			expect(calls).toEqual(["a", "b", "a"]);
+			expect(response(-4)).toMatchObject({ request_id: -4, payload: { error: expect.any(String) } });
+			expect(response(-5)).toMatchObject({ request_id: -5, payload: { result: "a" } });
+		} finally {
+			client.dispose();
+		}
+	});
+
 	it("writes typed shutdown control on fd3 without touching fd0", async () => {
 		const { stdin, control, client } = createClient();
 		const written = readWrittenFrame(control.written);

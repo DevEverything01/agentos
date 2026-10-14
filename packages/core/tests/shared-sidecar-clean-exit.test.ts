@@ -29,7 +29,7 @@ if (distMissing) {
  * itself, with no `process.exit()` escape hatch.
  */
 describe("shared sidecar clean exit", () => {
-	it.skipIf(distMissing)("a standalone create()+dispose() script exits on its own", () => {
+	it.skipIf(distMissing).each([false, true])("a standalone script exits after native disposal failure=%s", (nativeDisposeFailure) => {
 		const script = resolve(
 			import.meta.dirname,
 			"fixtures/shared-sidecar-clean-exit-script.mjs",
@@ -37,6 +37,10 @@ describe("shared sidecar clean exit", () => {
 		const result = spawnSync(process.execPath, [script], {
 			cwd: resolve(import.meta.dirname, ".."),
 			encoding: "utf8",
+			env: {
+				...process.env,
+				AGENTOS_TEST_NATIVE_DISPOSE_FAILURE: nativeDisposeFailure ? "1" : "0",
+			},
 			timeout: 60_000,
 		});
 

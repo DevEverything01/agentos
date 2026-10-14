@@ -137,8 +137,8 @@ export class StdioSidecarProtocolClient implements SidecarProcessTransport {
 		);
 	}
 
-	setSidecarRequestHandler(handler: LiveSidecarRequestHandler | null): void {
-		this.protocolClient.setSidecarRequestHandler(handler);
+	setSidecarRequestHandler(handler: LiveSidecarRequestHandler | null, vmId?: string): void {
+		this.protocolClient.setSidecarRequestHandler(handler, vmId);
 	}
 
 	onEvent(handler: (event: LiveEventFrame) => void): () => void {

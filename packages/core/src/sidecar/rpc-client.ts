@@ -499,35 +499,38 @@ export class NativeSidecarKernelProxy {
 			liveProcesses.map((entry) => this.signalProcess(entry, 15)),
 		);
 
-		await this.client.disposeVm(this.session, this.vm).catch(() => {});
-		for (const entry of liveProcesses) {
-			if (entry.exitCode === null) {
-				// The sidecar dispose path already performs TERM/KILL escalation for any
-				// guest executions that are still live. Resolve local waiters eagerly so
-				// VM teardown does not hang on killed ACP adapter processes that never
-				// surface a terminal process_exited event back to the JS bridge.
-				this.finishProcess(entry, 143);
+		try {
+			await this.client.disposeVm(this.session, this.vm);
+		} finally {
+			for (const entry of liveProcesses) {
+				if (entry.exitCode === null) {
+					// The sidecar dispose path already performs TERM/KILL escalation for any
+					// guest executions that are still live. Resolve local waiters eagerly so
+					// VM teardown does not hang on killed ACP adapter processes that never
+					// surface a terminal process_exited event back to the JS bridge.
+					this.finishProcess(entry, 143);
+				}
 			}
-		}
-		// Only tear down the shared sidecar process when this proxy owns it. VMs
-		// leased from an `AgentOsSidecar` handle share one process, which is
-		// disposed when the handle is disposed.
-		if (this.ownsClient) {
-			await this.client.dispose().catch(() => {});
-		}
-		await this.eventPump.catch(() => {});
-		await this.onDispose?.().catch(() => {});
+			// Only tear down the shared sidecar process when this proxy owns it. VMs
+			// leased from an `AgentOsSidecar` handle share one process, which is
+			// disposed when the handle is disposed.
+			if (this.ownsClient) {
+				await this.client.dispose().catch(() => {});
+			}
+			await this.eventPump.catch(() => {});
+			await this.onDispose?.().catch(() => {});
 
-		// Drop all per-VM tracking state so a disposed proxy retains nothing.
-		for (const entry of this.trackedProcesses.values()) {
-			entry.onStdout.clear();
-			entry.onStderr.clear();
+			// Drop all per-VM tracking state so a disposed proxy retains nothing.
+			for (const entry of this.trackedProcesses.values()) {
+				entry.onStdout.clear();
+				entry.onStderr.clear();
+			}
+			this.trackedProcesses.clear();
+			this.trackedProcessesById.clear();
+			this.signalStates.clear();
+			this.signalRefreshes.clear();
+			this.localMounts.length = 0;
 		}
-		this.trackedProcesses.clear();
-		this.trackedProcessesById.clear();
-		this.signalStates.clear();
-		this.signalRefreshes.clear();
-		this.localMounts.length = 0;
 	}
 
 	/** Test-only snapshot of the per-VM tracking collection sizes. */

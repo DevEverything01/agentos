@@ -98,6 +98,7 @@ export class SidecarProtocolClient {
 		timer: ReturnType<typeof setTimeout> | null;
 	}>();
 	private sidecarRequestHandler: LiveSidecarRequestHandler | null = null;
+	private readonly vmRequestHandlers = new Map<string, LiveSidecarRequestHandler>();
 
 	constructor(options: SidecarProtocolClientOptions) {
 		this.silenceTimeoutMs =
@@ -179,8 +180,16 @@ export class SidecarProtocolClient {
 		}
 	}
 
-	setSidecarRequestHandler(handler: LiveSidecarRequestHandler | null): void {
-		this.sidecarRequestHandler = handler;
+	setSidecarRequestHandler(
+		handler: LiveSidecarRequestHandler | null,
+		vmId?: string,
+	): void {
+		if (vmId !== undefined) {
+			if (handler) this.vmRequestHandlers.set(vmId, handler);
+			else this.vmRequestHandlers.delete(vmId);
+		} else {
+			this.sidecarRequestHandler = handler;
+		}
 	}
 
 	onEvent(handler: (event: LiveEventFrame) => void): () => void {
@@ -305,6 +314,8 @@ export class SidecarProtocolClient {
 			}
 		}
 		this.closedError = error;
+		this.vmRequestHandlers.clear();
+		this.sidecarRequestHandler = null;
 		this.stopSilenceWatchdog();
 		this.rejectPending(error);
 	}
@@ -340,7 +351,9 @@ export class SidecarProtocolClient {
 		});
 		const payload = await resolveSidecarRequestFramePayload(
 			request,
-			this.sidecarRequestHandler,
+			request.ownership.scope === "vm"
+				? this.vmRequestHandlers.get(request.ownership.vm_id) ?? null
+				: this.sidecarRequestHandler,
 		);
 
 		try {

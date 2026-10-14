@@ -382,8 +382,8 @@ export class SidecarProcess {
 		return SidecarProcess.fromClient(protocolClient);
 	}
 
-	setSidecarRequestHandler(handler: SidecarRequestHandler | null): void {
-		this.protocolClient.setSidecarRequestHandler(handler);
+	setSidecarRequestHandler(handler: SidecarRequestHandler | null, vmId?: string): void {
+		this.protocolClient.setSidecarRequestHandler(handler, vmId);
 	}
 
 	onEvent(handler: (event: EventFrame) => void): () => void {
