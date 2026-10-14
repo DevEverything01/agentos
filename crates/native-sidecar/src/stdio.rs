@@ -1417,6 +1417,15 @@ fn run_with_optional_control(
     run_with_optional_control_and_runtime(extensions, control_fd, None)
 }
 
+/// Run the extension wrapper with the same executor policy as the native binary.
+pub fn run_with_extensions_and_runtime_config(
+    extensions: Vec<Box<dyn Extension>>,
+    control_fd: Option<OwnedFd>,
+    runtime: agentos_runtime::RuntimeConfig,
+) -> Result<(), Box<dyn Error>> {
+    run_with_optional_control_and_runtime(extensions, control_fd, Some(runtime))
+}
+
 fn run_with_optional_control_and_runtime(
     extensions: Vec<Box<dyn Extension>>,
     control_fd: Option<OwnedFd>,
