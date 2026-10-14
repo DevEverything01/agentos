@@ -1,4 +1,4 @@
-import { closeSync, createReadStream, mkdirSync, readFileSync, readSync, writeSync } from 'node:fs';
+import { closeSync, createReadStream, mkdirSync, openSync, readFileSync, readSync, writeSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import * as moduleBuiltin from 'node:module';
 import { performance as realPerformance } from 'node:perf_hooks';
@@ -2432,6 +2432,60 @@ function resolvePythonSource(pyodide) {
   return requiredEnv(PYTHON_CODE_ENV);
 }
 
+// Pyodide MEMFS descriptors otherwise never enter the VM kernel FD table.
+// Reserve a real emulated device FD for every non-stdio Python stream so all
+// guest languages share limits.resources.maxOpenFds, including dup()/dup2().
+function installPythonKernelFdAccounting(pyodide) {
+  const fs = pyodide?.FS;
+  if (!Array.isArray(fs?.streams) || typeof fs.createStream !== 'function'
+      || typeof fs.closeStream !== 'function' || typeof fs.ErrnoError !== 'function') {
+    throw new Error('Pyodide FS stream accounting API is required');
+  }
+  const createStream = fs.createStream;
+  const closeStream = fs.closeStream;
+  const reservations = new Map();
+  const stdio = new Set([0, 1, 2].filter((fd) => fs.streams[fd]));
+  const reserve = () => {
+    try { return openSync('/dev/null', 'r'); }
+    catch (error) {
+      if (/\b(?:EMFILE|ENFILE)\b/.test(String(error?.message ?? error))) {
+        // EMFILE is errno 33 in the locked Emscripten/Pyodide runtime.
+        throw new fs.ErrnoError(33);
+      }
+      throw error;
+    }
+  };
+  for (const stream of fs.streams) {
+    if (stream && !stdio.has(stream.fd)) reservations.set(stream.fd, reserve());
+  }
+  Object.defineProperties(fs, {
+    createStream: { configurable: false, writable: false, value(stream, fd = -1) {
+      if (fd !== -1 && (reservations.has(fd) || stdio.has(fd))) {
+        return createStream.call(this, stream, fd);
+      }
+      const reserved = reserve();
+      try {
+        const result = createStream.call(this, stream, fd);
+        reservations.set(result.fd, reserved);
+        return result;
+      } catch (error) {
+        closeSync(reserved);
+        throw error;
+      }
+    } },
+    closeStream: { configurable: false, writable: false, value(fd) {
+      const result = closeStream.call(this, fd);
+      stdio.delete(fd);
+      if (reservations.has(fd)) {
+        const reserved = reservations.get(fd);
+        reservations.delete(fd);
+        closeSync(reserved);
+      }
+      return result;
+    } },
+  });
+}
+
 let pythonVfsRpcBridge = null;
 let retainLanguageContext = false;
 
@@ -2516,6 +2570,7 @@ try {
   const loadPyodideMs = realPerformance.now() - loadPyodideStarted;
   let packageLoadMs = 0;
 
+  installPythonKernelFdAccounting(pyodide);
   installPythonStdin(pyodide);
   installPythonWorkspaceFs(pyodide, pythonVfsRpcBridge);
   installPythonVfsSitePackages(pyodide);
