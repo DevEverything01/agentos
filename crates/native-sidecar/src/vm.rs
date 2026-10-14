@@ -2643,12 +2643,21 @@ fn vm_reconciliation_snapshot(
     runtime_context: &agentos_runtime::RuntimeContext,
     capabilities: &CapabilityRegistry,
 ) -> VmReconciliationSnapshot {
-    VmReconciliationSnapshot {
+    let snapshot = VmReconciliationSnapshot {
         active_tasks: runtime_context.tasks().active_scoped(),
         outstanding_capabilities: capabilities.outstanding_len(),
         ledger_zero: resources.is_zero(),
         integrity_ok: resources.integrity_ok(),
-    }
+    };
+    tracing::debug!(
+        vm_scope = resources.scope(),
+        active_tasks = snapshot.active_tasks,
+        outstanding_capabilities = snapshot.outstanding_capabilities,
+        ledger_zero = snapshot.ledger_zero,
+        integrity_ok = snapshot.integrity_ok,
+        "vm resource reconciliation"
+    );
+    snapshot
 }
 
 fn close_vm_admission(

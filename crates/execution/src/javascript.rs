@@ -667,7 +667,6 @@ impl GuestModuleResolution {
 }
 
 struct LocalBridgeState {
-    runtime: Option<RuntimeContext>,
     timer_resources: Option<Arc<agentos_runtime::accounting::ResourceLedger>>,
     max_timers: usize,
     translator: GuestPathTranslator,
@@ -698,7 +697,6 @@ impl Default for LocalBridgeState {
             .as_ref()
             .map(|runtime| Arc::clone(runtime.resources()));
         Self {
-            runtime,
             timer_resources,
             max_timers: MAX_TIMERS_PER_EXECUTION,
             translator: GuestPathTranslator::default(),
@@ -986,7 +984,7 @@ impl TimerAction {
 }
 
 impl TimerWheel {
-    fn get(runtime: &RuntimeContext) -> Result<&'static Arc<Self>, String> {
+    fn get() -> Result<&'static Arc<Self>, String> {
         if let Some(wheel) = JAVASCRIPT_TIMER_WHEEL.get() {
             return Ok(wheel);
         }
@@ -1000,7 +998,11 @@ impl TimerWheel {
             return Ok(wheel);
         }
 
-        let wheel = Self::start(runtime.clone())?;
+        // This singleton outlives every VM. Its worker must not hold the first
+        // timer caller's VM task reservation or admission scope.
+        let runtime = agentos_runtime::SidecarRuntime::process_context()
+            .map_err(|error| error.to_string())?;
+        let wheel = Self::start(runtime)?;
         let _ = JAVASCRIPT_TIMER_WHEEL.set(wheel);
         JAVASCRIPT_TIMER_WHEEL.get().ok_or_else(|| {
             String::from("ERR_AGENTOS_JAVASCRIPT_TIMER_WHEEL_INIT: timer wheel was not installed")
@@ -2901,7 +2903,6 @@ impl JavascriptExecutionEngine {
         // default + in-place assign: LocalBridgeState is Drop, so `..Default::default()`
         // (E0509) is not allowed.
         let mut local_bridge = LocalBridgeState::default();
-        local_bridge.runtime = Some(process_runtime);
         local_bridge.timer_resources = Some(Arc::clone(runtime.resources()));
         local_bridge.max_timers = javascript_max_timers(&request);
         local_bridge.translator = translator;
@@ -4613,12 +4614,7 @@ impl LocalBridgeState {
             (entry.delay_ms, entry.generation, self.timers.clone())
         };
 
-        let runtime = self.runtime.as_ref().ok_or_else(|| {
-            String::from(
-                "ERR_AGENTOS_RUNTIME_NOT_INJECTED: JavaScript timers require a process RuntimeContext",
-            )
-        })?;
-        TimerWheel::get(runtime)?.schedule(
+        TimerWheel::get()?.schedule(
             delay_ms,
             TimerAction::StreamEvent {
                 session,
@@ -4659,13 +4655,7 @@ impl LocalBridgeState {
         let generation = 0;
         let timers = self.timers.clone();
 
-        let Some(runtime) = self.runtime.as_ref() else {
-            self.clear_kernel_timer(timer_id);
-            let error = "ERR_AGENTOS_RUNTIME_NOT_INJECTED: JavaScript timers require a process RuntimeContext";
-            settle_timer_bridge_response(&session, call_id, 1, error.as_bytes().to_vec());
-            return;
-        };
-        let wheel = match TimerWheel::get(runtime) {
+        let wheel = match TimerWheel::get() {
             Ok(wheel) => wheel,
             Err(error) => {
                 self.clear_kernel_timer(timer_id);
@@ -8084,6 +8074,141 @@ mod tests {
         let result = execution.wait().expect("wait for prepared execution");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, b"started\n");
+    }
+
+    #[test]
+    fn busy_vm_timer_teardown_reconciles_and_keeps_sibling_timers_alive() {
+        use agentos_runtime::accounting::{ResourceClass, ResourceLedger};
+
+        // The bug depends on the first timer caller in the process. Give this
+        // regression its own singleton even when other tests already warmed it.
+        const CHILD_ENV: &str = "AGENTOS_TEST_BUSY_VM_TIMER_TEARDOWN";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "javascript::tests::busy_vm_timer_teardown_reconciles_and_keeps_sibling_timers_alive",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("spawn isolated timer teardown regression");
+            assert!(
+                status.success(),
+                "isolated timer teardown regression failed: {status}"
+            );
+            return;
+        }
+
+        let process = default_test_runtime_context().expect("process runtime");
+        let root = tempdir().expect("temporary execution root");
+        let start = |engine: &mut JavascriptExecutionEngine,
+                     runtime: RuntimeContext,
+                     vm_id: &str,
+                     code: &str| {
+            let context = engine.create_context(CreateJavascriptContextRequest {
+                vm_id: vm_id.to_owned(),
+                bootstrap_module: None,
+                compile_cache_root: None,
+            });
+            engine
+                .start_execution_with_runtime(
+                    StartJavascriptExecutionRequest {
+                        limits: JavascriptExecutionLimits {
+                            cpu_time_limit_ms: Some(0),
+                            wall_clock_limit_ms: Some(0),
+                            reactor_work_quantum: Some(64),
+                            bridge_call_timeout_ms: Some(5_000),
+                            ..Default::default()
+                        },
+                        guest_runtime: Default::default(),
+                        vm_id: vm_id.to_owned(),
+                        context_id: context.context_id,
+                        argv0: None,
+                        argv: vec![String::from("-e")],
+                        env: BTreeMap::new(),
+                        cwd: root.path().to_path_buf(),
+                        wasm_module_bytes: None,
+                        inline_code: Some(code.to_owned()),
+                    },
+                    runtime,
+                )
+                .expect("start scoped JavaScript")
+        };
+        let scoped = |generation| {
+            let resources = Arc::new(ResourceLedger::child(
+                format!("vm=timer-regression generation={generation}"),
+                ResourceClass::ALL.iter().map(|class| {
+                    (
+                        *class,
+                        process
+                            .resources()
+                            .configured_limit(*class)
+                            .expect("bounded process resource"),
+                    )
+                }),
+                Arc::clone(process.resources()),
+            ));
+            process.scoped_for_vm(resources, generation)
+        };
+        let victim = scoped(1);
+        let sibling = scoped(2);
+        let mut victim_engine = JavascriptExecutionEngine::new(victim.clone());
+        let mut sibling_engine = JavascriptExecutionEngine::new(sibling.clone());
+        let execution = start(
+            &mut victim_engine,
+            victim.clone(),
+            "timer-victim",
+            "setTimeout(() => console.log('too-late'), 30000); console.log('started')",
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "victim timer did not start");
+            if let Some(JavascriptExecutionEvent::Stdout(bytes)) = execution
+                .poll_event_blocking(Duration::from_millis(100))
+                .expect("poll victim")
+            {
+                if String::from_utf8_lossy(&bytes).contains("started") {
+                    break;
+                }
+            }
+        }
+        assert_eq!(victim.resources().usage(ResourceClass::Timers).used, 1);
+        let sibling_execution = start(
+            &mut sibling_engine,
+            sibling.clone(),
+            "timer-sibling",
+            "setTimeout(() => console.log('sibling-ok'), 1000)",
+        );
+        drop(execution);
+        drop(victim_engine);
+        victim.close_admission();
+        process.handle().block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                victim.tasks().wait_empty().await;
+                while !victim.resources().is_zero() {
+                    victim.resources().capacity_changed().await;
+                }
+            })
+            .await
+            .expect("victim scoped tasks must reconcile without the global timer worker");
+        });
+        assert_eq!(victim.tasks().active_scoped(), 0);
+        assert!(victim.resources().integrity_ok());
+        assert!(
+            victim.resources().is_zero(),
+            "victim ledger must reconcile: {:?}",
+            ResourceClass::ALL
+                .iter()
+                .filter_map(|class| {
+                    let used = victim.resources().usage(*class).used;
+                    (used > 0).then_some((*class, used))
+                })
+                .collect::<Vec<_>>()
+        );
+        let result = sibling_execution.wait().expect("sibling timer execution");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, b"sibling-ok\n");
     }
 
     // --- Timer cancellation / cap regression tests (U4: H2 bridge timers, M3
