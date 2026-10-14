@@ -3340,6 +3340,16 @@ fn mapped_runtime_host_path(
             guest_path
         ))
     };
+    // Explicit native mounts are kernel authorities. The direct host-path
+    // optimization does not apply the kernel permission and resource layers.
+    // Route every operation below such a mount through the shared kernel VFS.
+    if kernel.mounted_filesystems().iter().any(|mount| {
+        mount.path != "/"
+            && (normalized == mount.path
+                || normalized.starts_with(&format!("{}/", mount.path)))
+    }) {
+        return None;
+    }
     let mappings = process
         .env
         .get("AGENTOS_GUEST_PATH_MAPPINGS")
