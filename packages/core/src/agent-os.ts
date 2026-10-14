@@ -3329,6 +3329,7 @@ export class AgentOs {
 					packages: sidecarPackages,
 					packagesMountAt: OPT_AGENTOS_ROOT,
 					hostFunctionShimCommands: hostFunctionBootstrapCommands,
+					bootstrapCommands,
 				});
 				for (const command of configuredVm.projectedCommands) {
 					commandGuestPaths.set(command.name, command.guestPath);
